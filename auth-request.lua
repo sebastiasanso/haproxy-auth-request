@@ -27,99 +27,103 @@ local http = require("socket.http")
 -- returns the resulting socket.
 -- @return Socket
 function create_sock()
-	local sock = core.tcp()
+        local sock = core.tcp()
 
-	-- https://www.mail-archive.com/haproxy@formilux.org/msg28574.html
-	sock.old_receive = sock.receive
-	sock.receive = function(socket, pattern, prefix)
-		local a, b
-		if pattern == nil then pattern = "*l" end
-		if prefix == nil then
-			a, b = sock:old_receive(pattern)
-		else
-			a, b = sock:old_receive(pattern, prefix)
-		end
-		return a, b
-	end
+        -- https://www.mail-archive.com/haproxy@formilux.org/msg28574.html
+        sock.old_receive = sock.receive
+        sock.receive = function(socket, pattern, prefix)
+                local a, b
+                if pattern == nil then pattern = "*l" end
+                if prefix == nil then
+                        a, b = sock:old_receive(pattern)
+                else
+                        a, b = sock:old_receive(pattern, prefix)
+                end
+                return a, b
+        end
 
-	-- https://www.mail-archive.com/haproxy@formilux.org/msg28604.html
-	sock.old_settimeout = sock.settimeout
-	sock.settimeout = function(socket, timeout)
-		socket:old_settimeout(timeout)
+        -- https://www.mail-archive.com/haproxy@formilux.org/msg28604.html
+        sock.old_settimeout = sock.settimeout
+        sock.settimeout = function(socket, timeout)
+                socket:old_settimeout(timeout)
 
-		return 1
-	end
+                return 1
+        end
 
-	return sock
+        return sock
 end
 
 core.register_action("auth-request", { "http-req" }, function(txn, be, path)
-	txn:set_var("txn.auth_response_successful", false)
+    txn:set_var("txn.auth_response_successful", false)
 
-	-- Check whether the given backend exists.
-	if core.backends[be] == nil then
-		txn:Alert("Unknown auth-request backend '" .. be .. "'")
-		txn:set_var("txn.auth_response_code", 500)
-		return
-	end
+    -- Check whether the given backend exists.
+    if core.backends[be] == nil then
+            txn:Alert("Unknown auth-request backend '" .. be .. "'")
+            txn:set_var("txn.auth_response_code", 500)
+            return
+    end
 
-	-- Check whether the given backend has servers that
-	-- are not `DOWN`.
-	local addr = nil
-	for name, server in pairs(core.backends[be].servers) do
-		local status = server:get_stats()['status']
-		if status == "no check" or status:find("UP") == 1 then
-			addr = server:get_addr()
-			break
-		end
-	end
-	if addr == nil then
-		txn:Warning("No servers available for auth-request backend: '" .. be .. "'")
-		txn:set_var("txn.auth_response_code", 500)
-		return
-	end
+    -- Check whether the given backend has servers that
+    -- are not `DOWN`.
+    local addr = nil
+    for name, server in pairs(core.backends[be].servers) do
+            local status = server:get_stats()['status']
+            if status == "no check" or status:find("UP") == 1 then
+                    addr = server:get_addr()
+                    break
+            end
+    end
+    if addr == nil then
+        txn:Warning("No servers available for auth-request backend: '" .. be .. "'")
+        txn:set_var("txn.auth_response_code", 500)
+        return
+    end
 
-	-- Transform table of request headers from haproxy's to
-	-- socket.http's format.
-	local headers = {}
-	for header, values in pairs(txn.http:req_get_headers()) do
-		if header ~= 'content-length' then
-			for i, v in pairs(values) do
-				if headers[header] == nil then
-					headers[header] = v
-				else
-					headers[header] = headers[header] .. ", " .. v
-				end
-			end
-		end
-	end
+    -- Transform table of request headers from haproxy's to
+    -- socket.http's format.
+    local headers = {}
+    for header, values in pairs(txn.http:req_get_headers()) do
+        if header ~= 'content-length' then
+            for i, v in pairs(values) do
+                if headers[header] == nil then
+                        headers[header] = v
+                else
+                        headers[header] = headers[header] .. ", " .. v
+                end
+            end
+        end
+    end
 
-	-- Make request to backend.
-	local b, c, h = http.request {
-		url = "http://" .. addr .. path,
-		headers = headers,
-		create = create_sock,
-		-- Disable redirects, because DNS does not work here.
-		redirect = false
-	}
+    if headers["authorization"] == nil or headers["authorization"] == "" then
+        txn:set_var("txn.auth_response_code", 401)
+        return
+    end
 
-	-- Check whether we received a valid HTTP response.
-	if b == nil then
-		txn:Warning("Failure in auth-request backend '" .. be .. "': " .. c)
-		txn:set_var("txn.auth_response_code", 500)
-		return
-	end
+    -- Make request to backend.
+    local res = {}
+    local b, c, h, s = http.request {
+        url = "http://" .. addr .. path,
+        headers = headers,
+        create = create_sock,
+        -- Disable redirects, because DNS does not work here.
+        redirect = false
+    }
 
-	-- 2xx: Allow request.
-	if 200 <= c and c < 300 then
-		txn:set_var("txn.auth_response_successful", true)
-		txn:set_var("txn.auth_response_code", c)
-	-- 401 / 403: Do not allow request.
-	elseif c == 401 or c == 403 then
-		txn:set_var("txn.auth_response_code", c)
-	-- Everything else: Do not allow request and log.
-	else
-		txn:Warning("Invalid status code in auth-request backend '" .. be .. "': " .. c)
-		txn:set_var("txn.auth_response_code", c)
-	end
+    -- 2xx: Allow request.
+    if 200 <= c and c < 300 then
+        txn:set_var("txn.auth_response_successful", true)
+        txn:set_var("txn.auth_response_code", c)
+        if h["x-user"] ~= nil then
+            txn.http:req_add_header("X-User", h["x-user"])
+        elseif h["X-User"] ~= nil then
+            txn.http:req_add_header("X-User", h["X-User"])
+        end
+    -- 401 / 403: Do not allow request.
+    elseif c == 401 or c == 403 then
+        txn:set_var("txn.auth_response_code", c)
+    -- Everything else: Do not allow request and log.
+    else
+        txn:Warning("Invalid status code in auth-request backend '" .. be .. "': " .. c)
+        txn:set_var("txn.auth_response_code", c)
+    end
 end, 2)
